@@ -34,7 +34,7 @@ install_hint() {
 cmd_scripts() {
   say "Linking backend scripts into $BIN_DIR"
   mkdir -p "$BIN_DIR"
-  for s in tryx-ctl rgb-ctl; do ln -sfn "$here/backend/$s" "$BIN_DIR/$s"; echo "  $BIN_DIR/$s"; done
+  for s in tryx-ctl rgb-ctl tryx-sync; do ln -sfn "$here/backend/$s" "$BIN_DIR/$s"; echo "  $BIN_DIR/$s"; done
 
   say "Checking dependencies"
   local missing=0
