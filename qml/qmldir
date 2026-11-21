@@ -1,0 +1,5 @@
+module RgbDisplayWidget
+RgbDisplayWidget 1.0 RgbDisplayWidget.qml
+Chip 1.0 Chip.qml
+BarSlider 1.0 BarSlider.qml
+DisplayTab 1.0 DisplayTab.qml

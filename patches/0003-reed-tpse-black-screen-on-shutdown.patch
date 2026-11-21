@@ -1,0 +1,63 @@
+diff --git a/cli/main.cpp b/cli/main.cpp
+index 62ec25a..92ac8a7 100644
+--- a/cli/main.cpp
++++ b/cli/main.cpp
+@@ -1,6 +1,7 @@
+ #include <atomic>
+ #include <chrono>
+ #include <csignal>
++#include <cstdio>
+ #include <cstring>
+ #include <filesystem>
+ #include <iostream>
+@@ -15,6 +16,16 @@ namespace fs = std::filesystem;
+ 
+ static std::atomic<bool> g_running{true};
+ 
++// True while the system manager is shutting down / rebooting.
++static bool host_is_stopping() {
++  FILE* p = popen("systemctl is-system-running 2>/dev/null", "r");
++  if (!p) return false;
++  char buf[64] = {0};
++  const char* r = fgets(buf, sizeof buf, p);
++  pclose(p);
++  return r && std::strncmp(buf, "stopping", 8) == 0;
++}
++
+ static void signal_handler(int sig) {
+   if (sig == SIGTERM || sig == SIGINT) {
+     g_running = false;
+@@ -328,17 +339,32 @@ static int cmd_daemon_start(const std::string& port, bool foreground,
+   device.set_screen_config(screen_config);
+   device.set_brightness(state->brightness);
+ 
++  // Panel must be on (a previous run may have blanked it at host shutdown), and
++  // when the host goes silent the firmware should fall back to black, not its
++  // standby animation. NB: displayInSleep reads backwards: false = black.
++  device.send_command("POST", "waterBlockScreen", "{\"enable\":true}");
++  device.send_command("POST", "displayInSleep", "{\"enable\":false}");
++
+   std::cout << "Display restored. Running keepalive...\n";
+ 
+   std::signal(SIGINT, signal_handler);
+   std::signal(SIGTERM, signal_handler);
+ 
+   while (g_running) {
+-    std::this_thread::sleep_for(std::chrono::seconds(keepalive_interval));
++    // Sleep in 1s slices so SIGTERM (host shutdown) is honoured promptly.
++    for (int i = 0; i < keepalive_interval && g_running; ++i)
++      std::this_thread::sleep_for(std::chrono::seconds(1));
+     if (!g_running) break;
+     device.handshake();
+   }
+ 
++  // Stopped because the host is shutting down: blank the panel now instead of
++  // letting the firmware show its standby clip. A plain service restart (widget
++  // toggle, upgrade) must NOT blank it, hence the check.
++  if (host_is_stopping()) {
++    device.send_command("POST", "waterBlockScreen", "{\"enable\":false}");
++  }
++
+   return 0;
+ }
+ 

@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""Drop-folder sync for the TRYX Panorama display.
+
+  tryx-sync dir      print (and create) the drop folder
+  tryx-sync sync     make the cooler's media match the drop folder; prints one JSON line
+
+Drag videos / GIFs / images into the drop folder. New or changed files are converted to a
+panel-safe MP4 when needed (2:1, H.264, yuv420p) and pushed to /sdcard/pcMedia/ over adb.
+Files removed from the folder are removed from the cooler, but ONLY if this tool uploaded them;
+media put there by other software is never touched. No shell is ever invoked.
+"""
+import fcntl, hashlib, json, math, os, re, subprocess, sys, tempfile, time
+
+HOME = os.path.expanduser("~")
+CFG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "rgb-display-widget")
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"), "rgb-display-widget")
+THUMBS = os.path.join(CACHE, "thumbs")
+MANIFEST = os.path.join(CACHE, "sync.json")
+REMOTE = "/sdcard/pcMedia/"
+W, H = 2160, 1080                       # panel is 2:1
+VIDEO = {".mp4", ".webm", ".mkv", ".avi", ".mov", ".m4v"}
+IMAGE = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+GIF = {".gif"}
+SKIP_SUFFIX = (".part", ".crdownload", ".tmp", ".download", "~")
+MIN_AGE = 2.0                           # seconds since last write, to avoid half-copied files
+
+
+def media_dir():
+    d = os.environ.get("TRYX_MEDIA_DIR", "").strip()
+    if not d:
+        try:
+            d = open(os.path.join(CFG, "media-dir")).read().strip()
+        except OSError:
+            d = ""
+    d = os.path.expanduser(d) if d else os.path.join(HOME, "Videos", "tryx-display")
+    return d
+
+
+def safe_name(name):
+    n = re.sub(r"[^A-Za-z0-9._ ()+,-]", "_", name)
+    n = n.lstrip(".-")
+    n = n.replace("..", "_")
+    return n or "media"
+
+
+def run(args, **kw):
+    return subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, text=True, **kw)
+
+
+def adb(*args):
+    return run(["adb", *args])
+
+
+def probe(path):
+    r = run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+             "stream=codec_name,pix_fmt,width,height:format=duration", "-of", "json", path])
+    try:
+        j = json.loads(r.stdout)
+        s = (j.get("streams") or [{}])[0]
+        return s, float((j.get("format") or {}).get("duration") or 0)
+    except Exception:
+        return {}, 0.0
+
+
+def make_thumb(src, devname):
+    os.makedirs(THUMBS, exist_ok=True)
+    out = os.path.join(THUMBS, devname + ".jpg")
+    run(["ffmpeg", "-v", "error", "-y", "-i", src, "-frames:v", "1", "-vf", "scale=320:-2", out])
+
+
+def convert(src, ext, dst):
+    """Convert src to a panel-safe MP4 at dst. Returns error string or None."""
+    vf = (f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
+          f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p")
+    pre = []
+    if ext in IMAGE:
+        pre = ["-loop", "1", "-t", "8"]
+    elif ext in GIF:
+        _, dur = probe(src)
+        loops = max(0, math.ceil(10 / dur) - 1) if dur > 0 else 0
+        if loops:
+            pre = ["-stream_loop", str(min(loops, 200))]
+    cmd = ["ffmpeg", "-v", "error", "-y", *pre, "-i", src, "-an", "-vf", vf, "-r", "30",
+           "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-movflags", "+faststart", dst]
+    r = run(cmd)
+    if r.returncode != 0 or not os.path.exists(dst):
+        return (r.stderr.strip().splitlines() or ["ffmpeg failed"])[-1]
+    return None
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "sync"
+    mdir = media_dir()
+    if cmd == "dir":
+        os.makedirs(mdir, exist_ok=True)
+        print(mdir)
+        return
+    if cmd != "sync":
+        print("usage: tryx-sync dir|sync", file=sys.stderr)
+        sys.exit(2)
+
+    os.makedirs(CACHE, exist_ok=True)
+    os.makedirs(mdir, exist_ok=True)
+    lock = open(os.path.join(CACHE, "sync.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print(json.dumps({"busy": True, "added": [], "removed": [], "errors": [], "pending": 0}))
+        return
+
+    out = {"busy": False, "added": [], "removed": [], "errors": [], "pending": 0, "dir": mdir}
+    try:
+        manifest = json.load(open(MANIFEST))
+    except Exception:
+        manifest = {}
+
+    # What is in the folder (top level only)
+    sources = {}
+    now = time.time()
+    for name in sorted(os.listdir(mdir)):
+        p = os.path.join(mdir, name)
+        if name.startswith(".") or name.lower().endswith(SKIP_SUFFIX) or not os.path.isfile(p):
+            continue
+        ext = os.path.splitext(name)[1].lower()
+        if ext not in VIDEO | IMAGE | GIF:
+            continue
+        st = os.stat(p)
+        if now - st.st_mtime < MIN_AGE:
+            out["pending"] += 1          # still being written; pick it up next round
+            continue
+        sources[name] = (p, ext, st)
+
+    # Is the cooler there?
+    dev = adb("devices")
+    if "\tdevice" not in dev.stdout:
+        out["errors"].append("Cooler not connected over adb")
+        print(json.dumps(out))
+        return
+    ls = adb("shell", "ls", "-1", REMOTE)
+    on_device = {l.strip() for l in ls.stdout.splitlines() if l.strip()}
+    owned = {e["dev"] for e in manifest.values()}
+
+    # Add / update
+    for name, (p, ext, st) in sources.items():
+        e = manifest.get(name)
+        if e and e["mtime"] == int(st.st_mtime) and e["size"] == st.st_size and e["dev"] in on_device:
+            continue
+        s, _ = probe(p)
+        direct = (ext == ".mp4" and s.get("codec_name") == "h264" and s.get("pix_fmt") == "yuv420p"
+                  and int(s.get("width") or 0) <= 3840)
+        devname = safe_name(name if direct else os.path.splitext(name)[0] + ".mp4")
+        if e:
+            devname = e["dev"]             # keep the existing name when a file is updated
+        elif devname in on_device and devname not in owned:
+            # never overwrite media we did not upload
+            stem, dext = os.path.splitext(devname)
+            devname = f"{stem}-{hashlib.sha1(name.encode()).hexdigest()[:6]}{dext}"
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                push_src = p
+                if not direct:
+                    push_src = os.path.join(td, devname)
+                    err = convert(p, ext, push_src)
+                    if err:
+                        out["errors"].append(f"{name}: {err}")
+                        continue
+                r = adb("push", push_src, REMOTE + devname)
+                if r.returncode != 0 or "pushed" not in (r.stdout + r.stderr):
+                    out["errors"].append(f"{name}: upload failed")
+                    continue
+                make_thumb(push_src, devname)
+        except Exception as ex:             # keep going with the other files
+            out["errors"].append(f"{name}: {ex}")
+            continue
+        manifest[name] = {"mtime": int(st.st_mtime), "size": st.st_size, "dev": devname}
+        on_device.add(devname)
+        out["added"].append(devname)
+
+    # Remove what we uploaded and the user has since deleted from the folder
+    # (skip if the folder listing is empty AND nothing was readable, e.g. an unmounted drive)
+    for name in list(manifest):
+        if name in sources or os.path.exists(os.path.join(mdir, name)):
+            continue
+        devname = manifest[name]["dev"]
+        if re.fullmatch(r"[A-Za-z0-9._ ()+,-]+", devname) and ".." not in devname:
+            adb("shell", "rm -- '" + REMOTE + devname + "'")
+            try:
+                os.remove(os.path.join(THUMBS, devname + ".jpg"))
+            except OSError:
+                pass
+            out["removed"].append(devname)
+        del manifest[name]
+
+    tmp = MANIFEST + ".tmp"
+    json.dump(manifest, open(tmp, "w"))
+    os.replace(tmp, MANIFEST)
+    print(json.dumps(out))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,74 @@
+diff --git a/cli/main.cpp b/cli/main.cpp
+index 49a3f74..62ec25a 100644
+--- a/cli/main.cpp
++++ b/cli/main.cpp
+@@ -40,6 +40,7 @@ static void print_usage(const char* prog) {
+          "specified)\n"
+          "  -v, --verbose           Verbose output\n"
+          "  --ratio <2:1|1:1>       Display ratio (default: 2:1)\n"
++         "  --mode <full|split>     Screen mode: one image, or two images split (default: full)\n"
+          "  --brightness <0-100>    Set brightness with display command\n"
+          "  --keepalive             Stay running with keepalive (default: exit)\n"
+          "  --foreground            Run daemon in foreground\n";
+@@ -145,8 +146,9 @@ static int cmd_upload(const std::string& file, bool verbose) {
+ 
+ static int cmd_display(const std::string& port,
+                        const std::vector<std::string>& files,
+-                       const std::string& ratio, int brightness, bool keepalive,
+-                       int keepalive_interval, bool verbose) {
++                       const std::string& ratio, const std::string& screen_mode,
++                       int brightness, bool keepalive, int keepalive_interval,
++                       bool verbose) {
+   if (brightness < 0 || brightness > 100) {
+     std::cerr << "Brightness must be 0-100\n";
+     return 1;
+@@ -173,6 +175,7 @@ static int cmd_display(const std::string& port,
+   reed::ScreenConfig config;
+   config.media = media_files;
+   config.ratio = ratio;
++  config.screen_mode = screen_mode;
+ 
+   device.set_screen_config(config);
+   device.set_brightness(brightness);
+@@ -189,6 +192,7 @@ static int cmd_display(const std::string& port,
+   reed::DisplayState state;
+   state.media = media_files;
+   state.ratio = ratio;
++  state.screen_mode = screen_mode;
+   state.brightness = brightness;
+   reed::ConfigManager::save_state(state);
+ 
+@@ -369,6 +373,7 @@ int main(int argc, char* argv[]) {
+   std::string port = config.port;
+   bool verbose = false;
+   std::string ratio = "2:1";
++  std::string screen_mode = "Full Screen";
+   int brightness = config.brightness;
+   bool keepalive = false;
+   bool foreground = false;
+@@ -388,6 +393,16 @@ int main(int argc, char* argv[]) {
+       verbose = true;
+     } else if (arg == "--ratio") {
+       if (++i < argc) ratio = argv[i];
++    } else if (arg == "--mode") {
++      if (++i < argc) {
++        std::string m = argv[i];
++        if (m == "full") screen_mode = "Full Screen";
++        else if (m == "split") screen_mode = "Screen Splitting";
++        else {
++          std::cerr << "--mode must be 'full' or 'split'\n";
++          return 1;
++        }
++      }
+     } else if (arg == "--brightness") {
+       if (++i < argc) brightness = std::atoi(argv[i]);
+     } else if (arg == "--keepalive") {
+@@ -441,7 +456,7 @@ int main(int argc, char* argv[]) {
+       std::cerr << "Usage: reed-tpse display <file...>\n";
+       return 1;
+     }
+-    return cmd_display(port, args, ratio, brightness, keepalive,
++    return cmd_display(port, args, ratio, screen_mode, brightness, keepalive,
+                        keepalive_interval, verbose);
+   } else if (command == "brightness") {
+     if (args.empty()) {

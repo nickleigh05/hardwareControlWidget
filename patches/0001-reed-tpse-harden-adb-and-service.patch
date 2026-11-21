@@ -1,0 +1,144 @@
+diff --git a/src/adb.cpp b/src/adb.cpp
+index 2e4202a..7815bc8 100644
+--- a/src/adb.cpp
++++ b/src/adb.cpp
+@@ -1,55 +1,75 @@
+ #include "reed/adb.hpp"
+ 
++#include <sys/wait.h>
++#include <unistd.h>
++
+ #include <array>
+ #include <cstdio>
+-#include <memory>
+ #include <sstream>
+ 
+ namespace reed {
+ 
+ namespace {
+-struct PipeCloser {
+-  void operator()(FILE* f) const {
+-    if (f) pclose(f);
++
++// Single-quote a string for the Android-side shell (adb shell re-parses args).
++std::string shell_quote(const std::string& in) {
++  std::string out = "'";
++  for (char c : in) {
++    if (c == '\'') out += "'\\''";
++    else out += c;
++  }
++  out += "'";
++  return out;
++}
++
++// Remote names must be plain filenames: no path separators or control chars.
++bool valid_remote_name(const std::string& name) {
++  if (name.empty() || name == "." || name == "..") return false;
++  for (unsigned char c : name) {
++    if (c == '/' || c < 0x20 || c == 0x7f) return false;
+   }
+-};
++  return true;
++}
++
+ }  // namespace
+ 
++// Runs `adb <args>` directly with execvp (no local shell), capturing
++// stdout+stderr.
+ std::optional<std::string> Adb::run_command(
+     const std::vector<std::string>& args) {
+-  std::string cmd = "adb";
+-  for (const auto& arg : args) {
+-    cmd += " ";
+-    // Shell escape
+-    if (arg.find(' ') != std::string::npos ||
+-        arg.find('\'') != std::string::npos) {
+-      cmd += "'";
+-      for (char c : arg) {
+-        if (c == '\'') {
+-          cmd += "'\\''";
+-        } else {
+-          cmd += c;
+-        }
+-      }
+-      cmd += "'";
+-    } else {
+-      cmd += arg;
+-    }
+-  }
+-  cmd += " 2>&1";
+-
+-  std::array<char, 4096> buffer;
+-  std::string result;
++  int fds[2];
++  if (pipe(fds) != 0) return std::nullopt;
+ 
+-  std::unique_ptr<FILE, PipeCloser> pipe(popen(cmd.c_str(), "r"));
+-  if (!pipe) {
++  pid_t pid = fork();
++  if (pid < 0) {
++    close(fds[0]);
++    close(fds[1]);
+     return std::nullopt;
+   }
+ 
+-  while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
+-    result += buffer.data();
++  if (pid == 0) {
++    dup2(fds[1], STDOUT_FILENO);
++    dup2(fds[1], STDERR_FILENO);
++    close(fds[0]);
++    close(fds[1]);
++    std::vector<char*> argv;
++    argv.push_back(const_cast<char*>("adb"));
++    for (const auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
++    argv.push_back(nullptr);
++    execvp("adb", argv.data());
++    _exit(127);
+   }
+ 
++  close(fds[1]);
++  std::string result;
++  std::array<char, 4096> buffer;
++  ssize_t n;
++  while ((n = read(fds[0], buffer.data(), buffer.size())) > 0) {
++    result.append(buffer.data(), static_cast<size_t>(n));
++  }
++  close(fds[0]);
++  int status = 0;
++  waitpid(pid, &status, 0);
+   return result;
+ }
+ 
+@@ -71,6 +91,7 @@ bool Adb::is_device_connected() {
+ }
+ 
+ bool Adb::push(const std::string& local_path, const std::string& remote_name) {
++  if (!valid_remote_name(remote_name)) return false;
+   std::string remote_path = std::string(MEDIA_PATH) + remote_name;
+   auto result = run_command({"push", local_path, remote_path});
+ 
+@@ -112,8 +133,9 @@ std::optional<std::vector<std::string>> Adb::list_media() {
+ }
+ 
+ bool Adb::remove(const std::string& filename) {
++  if (!valid_remote_name(filename)) return false;
+   std::string remote_path = std::string(MEDIA_PATH) + filename;
+-  auto result = run_command({"shell", "rm", remote_path});
++  auto result = run_command({"shell", "rm -- " + shell_quote(remote_path)});
+ 
+   return result && result->find("No such file") == std::string::npos;
+ }
+diff --git a/systemd/reed-tpse.service b/systemd/reed-tpse.service
+index 09a814c..76f57fa 100644
+--- a/systemd/reed-tpse.service
++++ b/systemd/reed-tpse.service
+@@ -5,7 +5,7 @@ After=local-fs.target
+ 
+ [Service]
+ Type=simple
+-ExecStart=/usr/local/bin/reed-tpse daemon start --foreground
++ExecStart=%h/.local/bin/reed-tpse daemon start --foreground
+ Restart=on-failure
+ RestartSec=5
+ 
