@@ -67,7 +67,18 @@ print(json.dumps({"connected": bool(files) or os.path.exists("/dev/ttyACM0"), "f
   sync) exec python3 -I "$here/tryx-sync" sync ;;
   dropdir) exec python3 -I "$here/tryx-sync" dir ;;
   info) exec "$BIN" -p "$(port)" info ;;
-  brightness) pct "${1:-}"; exec "$BIN" -p "$(port)" brightness "$1" ;;
+  brightness)
+    pct "${1:-}"
+    "$BIN" -p "$(port)" brightness "$1"
+    # reed-tpse's brightness command doesn't persist; save it so the UI and the daemon's re-apply keep it
+    STF="${XDG_STATE_HOME:-$HOME/.local/state}/reed-tpse/display.json" B="$1" python3 -I -c '
+import os, json
+p = os.environ["STF"]
+try:
+    d = json.load(open(p)); d["brightness"] = int(os.environ["B"])
+    tmp = p + ".tmp"; json.dump(d, open(tmp, "w")); os.replace(tmp, p)
+except Exception: pass'
+    ;;
   display)
     pct "${1:-}"; b="$1"; shift
     r="${1:-}"; [[ "$r" == "2:1" || "$r" == "1:1" ]] || die "ratio must be 2:1 or 1:1"; shift
